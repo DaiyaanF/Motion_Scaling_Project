@@ -1,0 +1,32 @@
+{
+  "participant_id": "P001",
+  "shapes": {
+    "circle": {
+      "size_param": "radius",
+      "sizes": {
+        "min": 0.02,
+        "max": 0.06,
+        "step": 0.02
+      }
+    },
+    "line": {
+      "size_param": "length",
+      "sizes": {
+        "min": 0.04,
+        "max": 0.08,
+        "step": 0.02
+      }
+    }
+  },
+  "rotations": [0, 45, 90],
+  "spatial_positions": [
+    {"x": 0.0, "y": 0.0, "z": 0.02},
+    {"x": 0.02, "y": 0.0, "z": 0.02},
+    {"x": -0.02, "y": 0.0, "z": 0.02}
+  ],
+  "motion_scales": [0.5, 1.0, 1.5],
+  "repetitions": 2,
+  "randomize": true,
+  "transition_delay": 1.0,
+  "auto_start": false
+}
