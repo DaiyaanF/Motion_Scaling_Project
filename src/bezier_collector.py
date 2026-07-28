@@ -56,6 +56,21 @@ from ambf_msgs.msg import RigidBodyState
 from frame_transform_manager import get_frame_manager
 from bezier_trajectory_cubic import CubicBezierTrajectoryGenerator
 
+# Default trajectory workspace, sized to guarantee the whole box stays inside
+# cameraL/cameraR's fixed frustum (ADF/world/world_stereo.yaml: 55 deg vertical
+# FOV, camera at z=-0.05 in CameraFrame) so the camera never has to move mid-trial.
+# At the box's nearest wall (0.12m in front of the camera, the tightest point
+# since the frustum is narrowest there), the vertical FOV allows +/-0.0625m;
+# +/-0.05m keeps ~20% margin. x/y reuse that same half-extent for a symmetric
+# box. Depth extends to 0.35m in front of the camera, where the frustum is far
+# wider, for a decent-sized working volume without risking the near wall.
+DEFAULT_BOUNDING_BOX = {
+    'x_min': -0.05, 'x_max': 0.05,
+    'y_min': -0.05, 'y_max': 0.05,
+    'z_min': -0.35, 'z_max': -0.17,
+}
+DEFAULT_START_POSITION = [0.0, 0.0, -0.26]  # box center
+
 
 class MotionScalingController:
     """
@@ -148,8 +163,8 @@ class SlidingWindowExperiment(Node):
         self.num_segments = num_segments
         self.arc_length = 0.05
         self.boundary_size = 0.15
-        self.bounding_box = bounding_box
-        self.start_position = np.array(start_position or [0, 0, -0.1])
+        self.bounding_box = bounding_box or DEFAULT_BOUNDING_BOX
+        self.start_position = np.array(start_position or DEFAULT_START_POSITION)
         self.video_rate = 10.0
 
         # Sliding window parameters
@@ -284,6 +299,10 @@ class SlidingWindowExperiment(Node):
 
         self.traj_pub = self.create_publisher(PointCloud, '/ambf/env/World/trajectory', 10)
         self.traj_size_pub = self.create_publisher(Float32, '/ambf/env/World/trajectory/radius', latched_qos)
+        # Red single-point marker at progress_idx -- visual-only "next point to
+        # head toward"; does not gate progress (see _update_progress).
+        self.target_pub = self.create_publisher(PointCloud, '/ambf/env/World/target_marker', 10)
+        self.target_size_pub = self.create_publisher(Float32, '/ambf/env/World/target_marker/radius', latched_qos)
         self.dist_pub = self.create_publisher(Float32, '/ambf/env/psm2/trajectory_dist', 1)
         self.scale_pub = self.create_publisher(Float32, '/ambf/teleop/scale', latched_qos)
 
@@ -639,10 +658,23 @@ class SlidingWindowExperiment(Node):
 
         self.traj_pub.publish(pc)
         self.traj_size_pub.publish(Float32(data=5.0))
+        self._publish_target_marker(self.trajectory_points[progress])
 
         self.last_visible_start = visible_start
         self.last_visible_end = visible_end
         self.last_publish_time = now
+
+    def _publish_target_marker(self, point):
+        """Publish the red single-point marker at the given trajectory point."""
+        pc = PointCloud()
+        pc.header.stamp = self.get_clock().now().to_msg()
+        pc.header.frame_id = 'CameraFrame'
+
+        for _ in range(self.fixed_cloud_size):
+            pc.points.append(Point32(x=point[0], y=point[1], z=point[2]))
+
+        self.target_pub.publish(pc)
+        self.target_size_pub.publish(Float32(data=8.0))
 
     def _publish_start_dot(self):
         """Publish start position indicator with fixed point cloud size."""
@@ -659,6 +691,7 @@ class SlidingWindowExperiment(Node):
 
         self.traj_pub.publish(pc)
         self.traj_size_pub.publish(Float32(data=10.0))
+        self._publish_target_marker(self.start_position)
 
         self.get_logger().info(
             f"Start position: [{self.start_position[0]:.3f}, "
@@ -880,16 +913,21 @@ Examples:
     python bezier_collector.py --participant P001 --segments 4 --fixed "1.0" \
         --lookahead 150 --lookbehind 20 --search-ahead 75 --search-behind 30
 
-    # Custom workspace bounds
+    # Custom workspace bounds (overrides the camera-fitted default box --
+    # widening this risks the trajectory leaving the camera's fixed FOV)
     python bezier_collector.py --participant P001 --segments 4 --fixed "1.0" \
-        --bounding-box "-0.15,0.15,-0.15,0.15,-0.20,-0.03" \
-        --start-position "0,0,-0.1"
+        --bounding-box "-0.05,0.05,-0.05,0.05,-0.35,-0.17" \
+        --start-position "0,0,-0.26"
 
 Arguments:
     --participant          Participant ID (required)
     --segments             Number of Bezier segments (default: 4)
     --fixed                Comma-separated scaling ratios (required unless --adaptive)
     --adaptive             Use adaptive scaling mode
+    --bounding-box         Workspace bounds "x_min,x_max,y_min,y_max,z_min,z_max"
+                            (default: sized to fit cameraL/cameraR's fixed FOV,
+                            see DEFAULT_BOUNDING_BOX -- the trajectory can no
+                            longer escape the operator's view)
     --lookahead            Points visible ahead of progress (default: 100)
     --lookbehind           Points visible behind progress (default: 10)
     --max-forward-speed    Max forward progress per frame (default: 10)
@@ -898,6 +936,6 @@ Arguments:
     --search-behind        Search window behind for closest point (default: 20)
     --points-per-segment   Sampling density per segment (default: 200)
     --proximity-threshold  Distance threshold in meters (default: 0.003)
-    --bounding-box         Workspace bounds "x_min,x_max,y_min,y_max,z_min,z_max"
-    --start-position       Start position "x,y,z"
+    --start-position       Start position "x,y,z" (default: box center, see
+                            DEFAULT_START_POSITION)
 """
