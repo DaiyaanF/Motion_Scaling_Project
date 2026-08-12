@@ -58,18 +58,23 @@ from bezier_trajectory_cubic import CubicBezierTrajectoryGenerator
 
 # Default trajectory workspace, sized to guarantee the whole box stays inside
 # cameraL/cameraR's fixed frustum (ADF/world/world_stereo.yaml: 55 deg vertical
-# FOV, camera at z=-0.05 in CameraFrame) so the camera never has to move mid-trial.
-# At the box's nearest wall (0.12m in front of the camera, the tightest point
-# since the frustum is narrowest there), the vertical FOV allows +/-0.0625m;
-# +/-0.05m keeps ~20% margin. x/y reuse that same half-extent for a symmetric
-# box. Depth extends to 0.35m in front of the camera, where the frustum is far
-# wider, for a decent-sized working volume without risking the near wall.
+# FOV, camera at z=-0.05 in CameraFrame) so the camera never has to move mid-trial,
+# AND pulled back in close to z=-0.1..-0.2 -- the depth range the team's original
+# (pre-camera-fit) defaults used, which is presumably where the PSM tooltip
+# naturally reaches in CameraFrame-relative coordinates. The previous version of
+# this box (z=-0.17..-0.35) was FOV-safe but too deep for the PSM to reach.
+# At the box's nearest wall (0.08m in front of the camera, the tightest point
+# since the frustum is narrowest there), the vertical FOV allows +/-0.0416m;
+# +/-0.03m keeps some margin. x/y reuse that same half-extent for a symmetric
+# box. If this still isn't reachable, the fix is to narrow/shift z further based
+# on where psm_pos actually sits during a comfortable teleop pose (see the
+# 'Progress:'/dist console log at runtime), not to widen the FOV assumption.
 DEFAULT_BOUNDING_BOX = {
-    'x_min': -0.05, 'x_max': 0.05,
-    'y_min': -0.05, 'y_max': 0.05,
-    'z_min': -0.35, 'z_max': -0.17,
+    'x_min': -0.03, 'x_max': 0.03,
+    'y_min': -0.03, 'y_max': 0.03,
+    'z_min': -0.25, 'z_max': -0.13,
 }
-DEFAULT_START_POSITION = [0.0, 0.0, -0.26]  # box center
+DEFAULT_START_POSITION = [0.0, 0.0, -0.19]  # box center
 
 
 class MotionScalingController:
@@ -142,8 +147,9 @@ class SlidingWindowExperiment(Node):
     Trajectory tracking experiment with sliding window visualization.
 
     The trajectory is pre-sampled into a continuous array of points. Visualization
-    displays a window centered on user progress, with configurable lookahead and
-    lookbehind distances. Progress updates are rate-limited to prevent visual jumps.
+    reveals the path in quarter-steps: Q1+Q2 are shown at the start, Q2+Q3 once
+    Q1 is complete, then Q3+Q4 once Q2 is complete (see _get_display_window).
+    Progress updates are rate-limited to prevent visual jumps.
 
     The point cloud maintains a fixed size to ensure consistent AMBF rendering.
     """
@@ -151,7 +157,6 @@ class SlidingWindowExperiment(Node):
     def __init__(self, participant_id, num_segments=10, scaling_mode='fixed',
                  fixed_ratios=None, initial_scale=1.0, adaptation_rate=0.1,
                  bounding_box=None, start_position=None,
-                 lookahead_points=100, lookbehind_points=10,
                  max_forward_speed=10, max_backward_speed=3,
                  points_per_segment=200, proximity_threshold=0.003,
                  search_ahead=50, search_behind=20):
@@ -167,14 +172,15 @@ class SlidingWindowExperiment(Node):
         self.start_position = np.array(start_position or DEFAULT_START_POSITION)
         self.video_rate = 10.0
 
-        # Sliding window parameters
-        self.lookahead_points = lookahead_points
-        self.lookbehind_points = lookbehind_points
+        # Progress parameters
         self.max_forward_speed = max_forward_speed
         self.max_backward_speed = max_backward_speed
         self.points_per_segment = points_per_segment
         self.proximity_threshold = proximity_threshold
-        self.fixed_cloud_size = lookahead_points + lookbehind_points
+        # quarter_size/fixed_cloud_size depend on total_points, set after
+        # _generate_trajectory() runs below
+        self.quarter_size = 0
+        self.fixed_cloud_size = 0
 
         # Search constraints prevent jumping to distant trajectory points
         self.search_ahead = search_ahead
@@ -249,6 +255,13 @@ class SlidingWindowExperiment(Node):
         self._setup_bag()
         self._setup_ros()
         self._generate_trajectory()
+        # Quarter-stepped display window: reveals two adjacent quarters of the
+        # full trajectory at a time (Q1+Q2 -> Q2+Q3 -> Q3+Q4). fixed_cloud_size
+        # is sized to the largest of those windows (Q3+Q4, which absorbs the
+        # remainder from total_points % 4) so every published cloud pads up to
+        # the same point count for stable AMBF rendering.
+        self.quarter_size = max(1, self.total_points // 4)
+        self.fixed_cloud_size = self.total_points - 2 * self.quarter_size
         self._record_metadata()
         self._publish_start_dot()
 
@@ -374,8 +387,8 @@ class SlidingWindowExperiment(Node):
             'arc_length': self.arc_length,
             'bounding_box': self.bounding_box,
             'start_position': self.start_position.tolist(),
-            'lookahead_points': self.lookahead_points,
-            'lookbehind_points': self.lookbehind_points,
+            'quarter_size': self.quarter_size,
+            'fixed_cloud_size': self.fixed_cloud_size,
             'max_forward_speed': self.max_forward_speed,
             'max_backward_speed': self.max_backward_speed,
             'search_ahead': self.search_ahead,
@@ -604,14 +617,25 @@ class SlidingWindowExperiment(Node):
             new_progress = max(0, min(self.total_points - 1, new_progress))
             self.progress_idx = new_progress
 
-            old_start = max(0, current_progress - self.lookbehind_points)
-            old_end = min(self.total_points, current_progress + self.lookahead_points)
-            new_start = max(0, new_progress - self.lookbehind_points)
-            new_end = min(self.total_points, new_progress + self.lookahead_points)
+            old_start, old_end = self._get_display_window(current_progress)
+            new_start, new_end = self._get_display_window(new_progress)
 
             window_changed = (old_start != new_start) or (old_end != new_end)
 
         return new_progress, window_changed
+
+    def _get_display_window(self, progress):
+        """
+        Quarter-stepped reveal window: always shows two adjacent quarters of
+        the full trajectory. Starts on Q1+Q2; once progress passes into Q2
+        (Q1 complete), reveals Q2+Q3; once progress passes into Q3 (Q2
+        complete), reveals Q3+Q4 and stays there through Q4 (there's no Q5).
+        """
+        quarter = min(3, progress // self.quarter_size)
+        window_idx = min(quarter, 2)
+        start = window_idx * self.quarter_size
+        end = self.total_points if window_idx == 2 else start + 2 * self.quarter_size
+        return start, end
 
     def _get_segment_for_point(self, point_idx):
         """Get segment index containing the given point index."""
@@ -632,8 +656,7 @@ class SlidingWindowExperiment(Node):
         if not force and (now - self.last_publish_time < 0.05):
             return
 
-        visible_start = max(0, progress - self.lookbehind_points)
-        visible_end = min(self.total_points, progress + self.lookahead_points)
+        visible_start, visible_end = self._get_display_window(progress)
 
         if visible_end <= visible_start:
             self.get_logger().warn(f"Invalid window: [{visible_start}:{visible_end}], progress={progress}")
@@ -761,6 +784,7 @@ class SlidingWindowExperiment(Node):
         completion_pct = progress / self.total_points if self.total_points > 0 else 0
         search_start = max(0, progress - self.search_behind)
         search_end = min(self.total_points, progress + self.search_ahead)
+        visible_start, visible_end = self._get_display_window(progress)
 
         self._record_to_bag('comprehensive', {
             'participant_id': self.participant_id,
@@ -772,8 +796,8 @@ class SlidingWindowExperiment(Node):
             'completion_pct': completion_pct,
             'current_segment': seg_idx,
             'closest_dist': float(self.closest_dist) if self.closest_dist < float('inf') else None,
-            'visible_start': max(0, progress - self.lookbehind_points),
-            'visible_end': min(self.total_points, progress + self.lookahead_points),
+            'visible_start': visible_start,
+            'visible_end': visible_end,
             'search_start': search_start,
             'search_end': search_end,
             'psm2_position': self.psm_pos.tolist() if self.psm_pos is not None else None,
@@ -792,7 +816,7 @@ class SlidingWindowExperiment(Node):
         self.get_logger().info(f"Segments: {self.num_segments}, Points: {self.total_points}")
         self.get_logger().info(f"Iterations: {self.total_iterations}")
         self.get_logger().info(f"Scaling: {self.scaling.mode}, ratios: {self.scaling.fixed_ratios}")
-        self.get_logger().info(f"Window: {self.lookbehind_points} behind, {self.lookahead_points} ahead")
+        self.get_logger().info(f"Display window: quarter-stepped, {self.quarter_size} pts/quarter")
         self.get_logger().info(f"Fixed cloud size: {self.fixed_cloud_size} points")
         self.get_logger().info(f"Search window: {self.search_behind} behind, {self.search_ahead} ahead")
         self.get_logger().info(f"Speed limits: fwd={self.max_forward_speed}, back={self.max_backward_speed} pts/frame")
@@ -834,8 +858,6 @@ def main():
     parser.add_argument('--initial-scale', type=float, default=1.0)
     parser.add_argument('--adaptation-rate', type=float, default=0.1)
 
-    parser.add_argument('--lookahead', type=int, default=100)
-    parser.add_argument('--lookbehind', type=int, default=10)
     parser.add_argument('--max-forward-speed', type=int, default=10)
     parser.add_argument('--max-backward-speed', type=int, default=3)
     parser.add_argument('--points-per-segment', type=int, default=200)
@@ -877,8 +899,6 @@ def main():
             adaptation_rate=args.adaptation_rate,
             bounding_box=bbox,
             start_position=start,
-            lookahead_points=args.lookahead,
-            lookbehind_points=args.lookbehind,
             max_forward_speed=args.max_forward_speed,
             max_backward_speed=args.max_backward_speed,
             points_per_segment=args.points_per_segment,
@@ -909,27 +929,30 @@ Examples:
     # Three iterations with different scaling ratios
     python bezier_collector.py --participant P001 --segments 4 --fixed "0.5,1.0,2.0"
 
-    # Custom sliding window parameters
+    # Custom closest-point search window (display window is quarter-stepped
+    # automatically and not independently configurable, see --segments)
     python bezier_collector.py --participant P001 --segments 4 --fixed "1.0" \
-        --lookahead 150 --lookbehind 20 --search-ahead 75 --search-behind 30
+        --search-ahead 75 --search-behind 30
 
     # Custom workspace bounds (overrides the camera-fitted default box --
     # widening this risks the trajectory leaving the camera's fixed FOV)
     python bezier_collector.py --participant P001 --segments 4 --fixed "1.0" \
-        --bounding-box "-0.05,0.05,-0.05,0.05,-0.35,-0.17" \
-        --start-position "0,0,-0.26"
+        --bounding-box "-0.03,0.03,-0.03,0.03,-0.25,-0.13" \
+        --start-position "0,0,-0.19"
 
 Arguments:
     --participant          Participant ID (required)
-    --segments             Number of Bezier segments (default: 4)
+    --segments             Number of Bezier segments (default: 4). Also sets the
+                            quarter-stepped display window (see _get_display_window):
+                            the full trajectory is split into quarters and revealed
+                            two at a time (Q1+Q2 -> Q2+Q3 -> Q3+Q4) as each quarter
+                            is completed -- not independently configurable.
     --fixed                Comma-separated scaling ratios (required unless --adaptive)
     --adaptive             Use adaptive scaling mode
     --bounding-box         Workspace bounds "x_min,x_max,y_min,y_max,z_min,z_max"
                             (default: sized to fit cameraL/cameraR's fixed FOV,
                             see DEFAULT_BOUNDING_BOX -- the trajectory can no
                             longer escape the operator's view)
-    --lookahead            Points visible ahead of progress (default: 100)
-    --lookbehind           Points visible behind progress (default: 10)
     --max-forward-speed    Max forward progress per frame (default: 10)
     --max-backward-speed   Max backward progress per frame (default: 3)
     --search-ahead         Search window ahead for closest point (default: 50)
