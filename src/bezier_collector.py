@@ -76,6 +76,12 @@ DEFAULT_BOUNDING_BOX = {
 }
 DEFAULT_START_POSITION = [0.0, 0.0, -0.19]  # box center
 
+# Where the trail and target marker are parked once the experiment is done.
+# The camera sits at z=-0.05 in CameraFrame looking toward -z, so anything at
+# positive z is behind it and never rendered. Used instead of publishing an
+# empty cloud because AMBF expects a fixed point count (see _publish_window).
+HIDDEN_POSITION = [0.0, 0.0, 1.0]
+
 
 class MotionScalingController:
     """
@@ -159,14 +165,22 @@ class SlidingWindowExperiment(Node):
                  bounding_box=None, start_position=None,
                  max_forward_speed=10, max_backward_speed=3,
                  points_per_segment=200, proximity_threshold=0.003,
-                 search_ahead=50, search_behind=20):
+                 search_ahead=50, search_behind=20,
+                 arc_length=0.05, trail_size=2.0):
 
         super().__init__('sliding_window_experiment')
 
         # Configuration
         self.participant_id = participant_id
         self.num_segments = num_segments
-        self.arc_length = 0.05
+        # Per-segment arc length. Above ~0.06m segments stop fitting reliably
+        # inside DEFAULT_BOUNDING_BOX and the generator falls back to clamped
+        # straight lines -- lengthen the trajectory with more segments instead.
+        self.arc_length = arc_length
+        # AMBF point size for the trajectory trail (was 5.0, too thick to see
+        # the curve's shape). Start dot (10.0) and target marker (8.0) stay
+        # larger so they stand out against the thinner trail.
+        self.trail_size = trail_size
         self.boundary_size = 0.15
         self.bounding_box = bounding_box or DEFAULT_BOUNDING_BOX
         self.start_position = np.array(start_position or DEFAULT_START_POSITION)
@@ -239,6 +253,7 @@ class SlidingWindowExperiment(Node):
         self.closest_dist = float('inf')
         self.init_complete = False
         self.waiting_for_start = False
+        self.experiment_done = False
         self.left_start_area = True
         self.current_iter = 0
         self.last_visible_start = -1
@@ -460,7 +475,7 @@ class SlidingWindowExperiment(Node):
     def _republish_timer_cb(self):
         """Republish trajectory at 10Hz for rendering stability."""
         with self.state_lock:
-            if not self.init_complete or self.waiting_for_start:
+            if not self.init_complete or self.waiting_for_start or self.experiment_done:
                 return
             progress = self.progress_idx
         self._publish_window(progress, force=True)
@@ -680,7 +695,7 @@ class SlidingWindowExperiment(Node):
             pc.points.append(Point32(x=last_pt[0], y=last_pt[1], z=last_pt[2]))
 
         self.traj_pub.publish(pc)
-        self.traj_size_pub.publish(Float32(data=5.0))
+        self.traj_size_pub.publish(Float32(data=self.trail_size))
         self._publish_target_marker(self.trajectory_points[progress])
 
         self.last_visible_start = visible_start
@@ -739,6 +754,7 @@ class SlidingWindowExperiment(Node):
         if self.current_iter >= self.total_iterations:
             self._record_to_bag('event', {'event': 'experiment_complete'})
             self.get_logger().info("All iterations complete")
+            self._hide_trail()
             self.shutdown()
             return
 
@@ -754,6 +770,27 @@ class SlidingWindowExperiment(Node):
 
         self._publish_start_dot()
         self.get_logger().info(f"Next: iteration {self.current_iter + 1}, scale {self.scaling.get_current_scale()}x")
+
+    def _hide_trail(self):
+        """Remove the trail and target marker from view to signal the experiment is done."""
+        with self.state_lock:
+            self.experiment_done = True
+
+        pc = PointCloud()
+        pc.header.frame_id = 'CameraFrame'
+        for _ in range(self.fixed_cloud_size):
+            pc.points.append(Point32(
+                x=HIDDEN_POSITION[0], y=HIDDEN_POSITION[1], z=HIDDEN_POSITION[2]))
+
+        # Publish a few times (as at iteration start) so the update lands
+        # before shutdown() tears down the node.
+        for _ in range(3):
+            pc.header.stamp = self.get_clock().now().to_msg()
+            self.traj_pub.publish(pc)
+            self.target_pub.publish(pc)
+            time.sleep(0.03)
+
+        self.get_logger().info("Trail cleared -- experiment done")
 
     def _record_to_bag(self, topic_suffix, data):
         """Write data to the ROS2 bag."""
@@ -850,7 +887,11 @@ def main():
     parser = argparse.ArgumentParser(description='Sliding Window Bezier Trajectory Experiment')
 
     parser.add_argument('--participant', required=True, help='Participant ID')
-    parser.add_argument('--segments', type=int, default=4, help='Number of segments')
+    parser.add_argument('--segments', type=int, default=8, help='Number of segments')
+    parser.add_argument('--arc-length', type=float, default=0.05,
+                        help='Arc length per segment in meters (keep <= 0.06 for the default box)')
+    parser.add_argument('--trail-size', type=float, default=2.0,
+                        help='Rendered point size of the trajectory trail')
 
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument('--fixed', type=str, help='Fixed ratios, e.g., "0.5,1.0,2.0"')
@@ -905,6 +946,8 @@ def main():
             proximity_threshold=args.proximity_threshold,
             search_ahead=args.search_ahead,
             search_behind=args.search_behind,
+            arc_length=args.arc_length,
+            trail_size=args.trail_size,
         )
         exp.spin()
     except KeyboardInterrupt:
@@ -942,7 +985,8 @@ Examples:
 
 Arguments:
     --participant          Participant ID (required)
-    --segments             Number of Bezier segments (default: 4). Also sets the
+    --segments             Number of Bezier segments (default: 8, ~0.4m total
+                            at the default --arc-length). Also sets the
                             quarter-stepped display window (see _get_display_window):
                             the full trajectory is split into quarters and revealed
                             two at a time (Q1+Q2 -> Q2+Q3 -> Q3+Q4) as each quarter
@@ -958,6 +1002,10 @@ Arguments:
     --search-ahead         Search window ahead for closest point (default: 50)
     --search-behind        Search window behind for closest point (default: 20)
     --points-per-segment   Sampling density per segment (default: 200)
+    --arc-length           Arc length per segment in meters (default: 0.05).
+                            Above ~0.06 segments often don't fit the default
+                            box; raise --segments for a longer trajectory instead.
+    --trail-size           Rendered point size of the trajectory trail (default: 2.0)
     --proximity-threshold  Distance threshold in meters (default: 0.003)
     --start-position       Start position "x,y,z" (default: box center, see
                             DEFAULT_START_POSITION)
