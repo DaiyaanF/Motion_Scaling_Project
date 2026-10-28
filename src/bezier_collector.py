@@ -642,7 +642,12 @@ class SlidingWindowExperiment(Node):
         elif self.scaling.mode in ('step', 'quadratic'):
             seg_idx_now = self._get_segment_for_point(new_progress)
             seg_start = self.segment_boundaries[seg_idx_now]
-            seg_end = self.segment_boundaries[seg_idx_now + 1]
+            # segment_boundaries holds only segment starts, so the last
+            # segment ends at total_points
+            if seg_idx_now + 1 < len(self.segment_boundaries):
+                seg_end = self.segment_boundaries[seg_idx_now + 1]
+            else:
+                seg_end = self.total_points
             progress_in_segment = (new_progress - seg_start) / max(1, seg_end - seg_start)
             self.scaling.update_by_segment(seg_idx_now, progress_in_segment)
         elif self.scaling.mode == 'curvature':
