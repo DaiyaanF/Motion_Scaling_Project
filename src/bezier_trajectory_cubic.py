@@ -83,6 +83,18 @@ class CubicBezierSegment:
             points.append(tuple(point))
         return points
     
+    def get_curvature_at_t(self, t_values):
+        """Per-point curvature at the given parametric t values (vectorized).
+        Pass the same t_values used for sample_points() to get a curvature
+        array aligned index-for-index with the sampled points."""
+        t_values = np.atleast_1d(np.clip(t_values, 0.001, 0.999))
+        first_deriv = self._bezier_derivative(t_values)
+        second_deriv = self._bezier_second_derivative(t_values)
+        cross_products = np.cross(first_deriv, second_deriv)
+        cross_norms = np.linalg.norm(cross_products, axis=1)
+        first_deriv_norms = np.linalg.norm(first_deriv, axis=1)
+        return cross_norms / (first_deriv_norms ** 3 + 1e-10)
+
     def get_point_at_t(self, t):
         return (
             (1 - t)**3 * self.P0 +

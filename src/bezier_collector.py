@@ -83,12 +83,34 @@ DEFAULT_START_POSITION = [0.0, 0.0, -0.19]  # box center
 HIDDEN_POSITION = [0.0, 0.0, 1.0]
 
 
+def _quadratic_ease(t):
+    """Ease-in-out quadratic, t in [0, 1]. Zero slope at both endpoints so
+    consecutive segments splice together without a velocity kink."""
+    t = max(0.0, min(1.0, t))
+    return 2 * t * t if t < 0.5 else 1 - pow(-2 * t + 2, 2) / 2
+
+
 class MotionScalingController:
     """
     Controls motion scaling ratio during teleoperation.
 
-    Supports two modes:
+    Supports four modes:
     - fixed: Cycles through predetermined scaling ratios across iterations
+    - step: One ratio per trajectory segment (quarter), changing abruptly at
+      each segment boundary -- e.g. ratios [0.5, 1.0] gives a hard jump from
+      0.5x to 1.0x the instant the operator crosses into the next segment.
+    - quadratic: Same per-segment target ratios as 'step', but the value
+      ramps smoothly from the current segment's ratio to the next segment's
+      ratio over the course of the segment (ease-in-out quadratic), so the
+      operator experiences intermediate values (e.g. 0.6, 0.7, ...) instead
+      of an instantaneous jump.
+    - curvature: Continuous, geometry-driven scaling (per paper Sec. V-C).
+      Scale is recomputed every tick from the trajectory's local curvature
+      at the operator's current position -- not quantized to segments at
+      all. Low curvature (straight, fast stretches) maps to the low end of
+      fixed_ratios, since that's where tracking error amplifies most at high
+      MSF; high curvature maps to the high end, since the operator's natural
+      deceleration there provides a protective effect.
     - adaptive: Adjusts scaling based on tracking error (experimental)
     """
 
@@ -98,12 +120,39 @@ class MotionScalingController:
         self.fixed_ratios = fixed_ratios or [1.0, 2.0, 3.0]
         self.current_ratio_idx = 0
         self.iteration_count = 0
-        self.current_scale = self.fixed_ratios[0] if mode == 'fixed' else initial_scale
+        self.current_scale = self.fixed_ratios[0] if mode in ('fixed', 'step', 'quadratic') else initial_scale
         self.initial_scale = initial_scale
         self.adaptation_rate = adaptation_rate
         self.error_history = deque(maxlen=window_size)
         self.last_error = None
         self.logger = logger
+        self._last_seg_idx = None
+        # Set via set_curvature_range() once the trajectory (and its
+        # curvature distribution) has been generated.
+        self.kappa_min = None
+        self.kappa_max = None
+
+    def set_curvature_range(self, kappa_min, kappa_max):
+        self.kappa_min = kappa_min
+        self.kappa_max = kappa_max
+        if self.logger:
+            scale_min, scale_max = self.fixed_ratios[0], self.fixed_ratios[-1]
+            self.logger.info(
+                f"Curvature-aware scaling: kappa [{kappa_min:.1f}, {kappa_max:.1f}] "
+                f"-> scale [{scale_min}x, {scale_max}x]")
+
+    def update_by_curvature(self, curvature):
+        """Continuous scale from instantaneous local curvature. Call every
+        tick with the curvature at the operator's current trajectory point."""
+        if self.mode != 'curvature' or self.kappa_min is None:
+            return
+        scale_min, scale_max = self.fixed_ratios[0], self.fixed_ratios[-1]
+        if self.kappa_max <= self.kappa_min:
+            frac = 0.0
+        else:
+            frac = (curvature - self.kappa_min) / (self.kappa_max - self.kappa_min)
+        frac = max(0.0, min(1.0, frac))
+        self.current_scale = scale_min + (scale_max - scale_min) * frac
 
     def get_current_scale(self):
         return self.current_scale
@@ -116,6 +165,28 @@ class MotionScalingController:
             self.current_scale = self.fixed_ratios[self.current_ratio_idx]
             if self.logger:
                 self.logger.info(f"Scale: {old_scale}x -> {self.current_scale}x")
+
+    def update_by_segment(self, seg_idx, progress_in_segment):
+        """Set current_scale for 'step'/'quadratic' modes. Call every tick
+        with the trajectory segment index and fractional progress [0, 1]
+        through that segment. No-op for other modes."""
+        if self.mode not in ('step', 'quadratic'):
+            return
+
+        n = len(self.fixed_ratios)
+        start_val = self.fixed_ratios[seg_idx % n]
+        end_val = self.fixed_ratios[(seg_idx + 1) % n]
+
+        if self.mode == 'step':
+            new_scale = start_val
+        else:
+            new_scale = start_val + (end_val - start_val) * _quadratic_ease(progress_in_segment)
+
+        if self.logger and seg_idx != self._last_seg_idx:
+            self.logger.info(f"Segment {seg_idx}: scale target {start_val}x -> {end_val}x ({self.mode})")
+            self._last_seg_idx = seg_idx
+
+        self.current_scale = new_scale
 
     def update_adaptive(self, error):
         if self.mode != 'adaptive':
@@ -144,6 +215,13 @@ class MotionScalingController:
                 'fixed_ratios': self.fixed_ratios,
                 'current_ratio_idx': self.current_ratio_idx,
                 'iteration_count': self.iteration_count
+            })
+        elif self.mode in ('step', 'quadratic'):
+            info.update({'fixed_ratios': self.fixed_ratios})
+        elif self.mode == 'curvature':
+            info.update({
+                'scale_range': [self.fixed_ratios[0], self.fixed_ratios[-1]],
+                'kappa_range': [self.kappa_min, self.kappa_max],
             })
         return info
 
@@ -231,6 +309,7 @@ class SlidingWindowExperiment(Node):
         # Trajectory data
         self.all_segments = []
         self.trajectory_points = None
+        self.trajectory_curvatures = None
         self.total_points = 0
         self.segment_boundaries = []
 
@@ -364,6 +443,7 @@ class SlidingWindowExperiment(Node):
 
         last_pt = self.start_position.copy()
         all_points = []
+        all_curvatures = []
         self.segment_boundaries = [0]
 
         for i in range(self.num_segments - 1):
@@ -371,8 +451,11 @@ class SlidingWindowExperiment(Node):
             seg.compute_metrics()
             self.all_segments.append(seg)
 
+            t_values = np.linspace(0, 1, self.points_per_segment)
             points = seg.sample_points(self.points_per_segment)
+            curvatures = seg.get_curvature_at_t(t_values)
             all_points.append(points[:-1])
+            all_curvatures.append(curvatures[:-1])
 
             self.segment_boundaries.append(len(all_points[-1]) + self.segment_boundaries[-1])
             self.get_logger().info(f"  Seg {i}: arc={seg.arc_length*1000:.1f}mm, curv_max={seg.curvature_max:.1f}")
@@ -382,12 +465,20 @@ class SlidingWindowExperiment(Node):
         seg.compute_metrics()
         self.all_segments.append(seg)
 
+        t_values = np.linspace(0, 1, self.points_per_segment)
         points = seg.sample_points(self.points_per_segment)
+        curvatures = seg.get_curvature_at_t(t_values)
         all_points.append(points)
+        all_curvatures.append(curvatures)
         self.get_logger().info(f"  Seg {self.num_segments-1} (return): arc={seg.arc_length*1000:.1f}mm")
 
         self.trajectory_points = np.vstack(all_points)
+        self.trajectory_curvatures = np.concatenate(all_curvatures)
         self.total_points = len(self.trajectory_points)
+
+        if self.scaling.mode == 'curvature':
+            self.scaling.set_curvature_range(
+                float(np.min(self.trajectory_curvatures)), float(np.max(self.trajectory_curvatures)))
 
         self.get_logger().info(f"Generated trajectory: {self.num_segments} segments, {self.total_points} points")
 
@@ -548,6 +639,14 @@ class SlidingWindowExperiment(Node):
 
         if self.scaling.mode == 'adaptive' and self.closest_dist < float('inf'):
             self.scaling.update_adaptive(self.closest_dist)
+        elif self.scaling.mode in ('step', 'quadratic'):
+            seg_idx_now = self._get_segment_for_point(new_progress)
+            seg_start = self.segment_boundaries[seg_idx_now]
+            seg_end = self.segment_boundaries[seg_idx_now + 1]
+            progress_in_segment = (new_progress - seg_start) / max(1, seg_end - seg_start)
+            self.scaling.update_by_segment(seg_idx_now, progress_in_segment)
+        elif self.scaling.mode == 'curvature':
+            self.scaling.update_by_curvature(self.trajectory_curvatures[new_progress])
 
         if now - self.last_progress_log_time > 2.0:
             pct = (new_progress / self.total_points) * 100
@@ -895,6 +994,13 @@ def main():
 
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument('--fixed', type=str, help='Fixed ratios, e.g., "0.5,1.0,2.0"')
+    group.add_argument('--step', type=str,
+                        help='Per-segment ratios, e.g., "0.5,1.0" -- abrupt change at each segment boundary')
+    group.add_argument('--quadratic', type=str,
+                        help='Per-segment ratios, e.g., "0.5,1.0" -- smooth quadratic ramp across each segment')
+    group.add_argument('--curvature', type=str,
+                        help='Scale range, e.g., "0.5,2.0" -- continuous scale driven by local trajectory '
+                             'curvature (low curvature -> low end, high curvature -> high end)')
     group.add_argument('--adaptive', action='store_true', help='Adaptive scaling')
     parser.add_argument('--initial-scale', type=float, default=1.0)
     parser.add_argument('--adaptation-rate', type=float, default=0.1)
@@ -911,8 +1017,24 @@ def main():
 
     args = parser.parse_args()
 
-    mode = 'fixed' if args.fixed else 'adaptive'
-    ratios = [float(x) for x in args.fixed.split(',')] if args.fixed else [1.0]
+    if args.fixed:
+        mode, ratio_str = 'fixed', args.fixed
+    elif args.step:
+        mode, ratio_str = 'step', args.step
+    elif args.quadratic:
+        mode, ratio_str = 'quadratic', args.quadratic
+    elif args.curvature:
+        mode, ratio_str = 'curvature', args.curvature
+    else:
+        mode, ratio_str = 'adaptive', None
+    ratios = [float(x) for x in ratio_str.split(',')] if ratio_str else [1.0]
+
+    if mode in ('step', 'quadratic') and len(ratios) < 2:
+        print("Error: --step/--quadratic need at least 2 ratios (start and target)")
+        sys.exit(1)
+    if mode == 'curvature' and len(ratios) != 2:
+        print("Error: --curvature needs exactly 2 values: scale_min,scale_max")
+        sys.exit(1)
 
     bbox = None
     if args.bounding_box:
